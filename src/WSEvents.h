@@ -46,6 +46,9 @@ class WSEvents : public QObject {
   private slots:
     void deferredInitOperations();
     void StreamStatus();
+    void StreamingStatistics();
+    void RecordingStatistics();
+    void ReplayBufferStatistics();
     void Heartbeat();
     void TransitionDurationChanged(int ms);
     void SelectedSceneChanged(
@@ -63,12 +66,17 @@ class WSEvents : public QObject {
 
     uint64_t _streamStarttime;
     uint64_t _recStarttime;
+    uint64_t _replayStarttime;
 
     uint64_t _lastBytesSent;
     uint64_t _lastBytesSentTime;
 
     void broadcastUpdate(const char* updateType,
         obs_data_t* additionalFields);
+
+    void WSEvents::broadcastOutputStatistics(obs_output_t *output,
+        const char *updateType, bool isLegacyStreamStatus,
+        uint64_t outputStartTime);
 
     void OnSceneChange();
     void OnSceneListChange();

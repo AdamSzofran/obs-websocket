@@ -75,6 +75,12 @@ WSEvents::WSEvents(WSServer* srv) {
     QTimer* statusTimer = new QTimer();
     connect(statusTimer, SIGNAL(timeout()),
         this, SLOT(StreamStatus()));
+    connect(statusTimer, SIGNAL(timeout()),
+        this, SLOT(StreamingStatistics()));
+    connect(statusTimer, SIGNAL(timeout()),
+        this, SLOT(RecordingStatistics()));
+    connect(statusTimer, SIGNAL(timeout()),
+        this, SLOT(ReplayBufferStatistics()));
     pulse = false;
     connect(statusTimer, SIGNAL(timeout()),
         this, SLOT(Heartbeat()));
@@ -96,6 +102,7 @@ WSEvents::WSEvents(WSServer* srv) {
 
     _streamStarttime = 0;
     _recStarttime = 0;
+    _replayStarttime = 0;
 }
 
 WSEvents::~WSEvents() {
@@ -555,6 +562,7 @@ void WSEvents::OnRecordingStopped() {
 * @since 4.2.0
 */
 void WSEvents::OnReplayStarting() {
+    _replayStarttime = os_gettime_ns();
     broadcastUpdate("ReplayStarting");
 }
 
@@ -591,6 +599,7 @@ void WSEvents::OnReplayStopping() {
 * @since 4.2.0
 */
 void WSEvents::OnReplayStopped() {
+    _replayStarttime = 0;
     broadcastUpdate("ReplayStopped");
 }
 
@@ -604,6 +613,57 @@ void WSEvents::OnReplayStopped() {
  */
 void WSEvents::OnExit() {
     broadcastUpdate("Exiting");
+}
+
+void WSEvents::broadcastOutputStatistics(obs_output_t *output, const char *updateType, bool isLegacyStreamStatus, uint64_t outputStartTime)
+{
+    uint64_t bytesSent = obs_output_get_total_bytes(output);
+    uint64_t bytesSentTime = os_gettime_ns();
+
+    if (bytesSent < _lastBytesSent)
+        bytesSent = 0;
+
+    if (bytesSent == 0)
+        _lastBytesSent = 0;
+
+    uint64_t bytesBetween = bytesSent - _lastBytesSent;
+    double timePassed =
+        double(bytesSentTime - _lastBytesSentTime) / 1000000000.0;
+
+    uint64_t bytesPerSec = bytesBetween / timePassed;
+
+    _lastBytesSent = bytesSent;
+    _lastBytesSentTime = bytesSentTime;
+
+    uint64_t totalOutputTime =
+        (os_gettime_ns() - outputStartTime) / 1000000000;
+
+    int totalFrames = obs_output_get_total_frames(output);
+    int droppedFrames = obs_output_get_frames_dropped(output);
+
+    float strain = obs_output_get_congestion(output);
+
+    OBSDataAutoRelease data = obs_data_create();
+    if (isLegacyStreamStatus)
+    {
+        obs_data_set_bool(data, "streaming", obs_frontend_streaming_active());
+        obs_data_set_bool(data, "recording", obs_frontend_recording_active());
+        obs_data_set_int(data, "total-stream-time", totalOutputTime);
+        obs_data_set_bool(data, "preview-only", false); // Retrocompat with OBSRemote
+    }
+    else
+    {
+        obs_data_set_bool(data, "output-running", obs_output_active(output));
+        obs_data_set_int(data, "total-output-time", totalOutputTime);
+    }
+    obs_data_set_int(data, "bytes-per-sec", bytesPerSec);
+    obs_data_set_int(data, "kbits-per-sec", (bytesPerSec * 8) / 1024);
+    obs_data_set_int(data, "num-total-frames", totalFrames);
+    obs_data_set_int(data, "num-dropped-frames", droppedFrames);
+    obs_data_set_double(data, "fps", obs_get_active_fps());
+    obs_data_set_double(data, "strain", strain);
+
+    broadcastUpdate(updateType, data);
 }
 
 /**
@@ -627,7 +687,6 @@ void WSEvents::OnExit() {
  */
 void WSEvents::StreamStatus() {
     bool streamingActive = obs_frontend_streaming_active();
-    bool recordingActive = obs_frontend_recording_active();
 
     OBSOutputAutoRelease streamOutput = obs_frontend_get_streaming_output();
 
@@ -635,46 +694,90 @@ void WSEvents::StreamStatus() {
         return;
     }
 
-    uint64_t bytesSent = obs_output_get_total_bytes(streamOutput);
-    uint64_t bytesSentTime = os_gettime_ns();
-
-    if (bytesSent < _lastBytesSent)
-        bytesSent = 0;
-
-    if (bytesSent == 0)
-        _lastBytesSent = 0;
-
-    uint64_t bytesBetween = bytesSent - _lastBytesSent;
-    double timePassed =
-        double(bytesSentTime - _lastBytesSentTime) / 1000000000.0;
-
-    uint64_t bytesPerSec = bytesBetween / timePassed;
-
-    _lastBytesSent = bytesSent;
-    _lastBytesSentTime = bytesSentTime;
-
-    uint64_t totalStreamTime =
-        (os_gettime_ns() - _streamStarttime) / 1000000000;
-
-    int totalFrames = obs_output_get_total_frames(streamOutput);
-    int droppedFrames = obs_output_get_frames_dropped(streamOutput);
-
-    float strain = obs_output_get_congestion(streamOutput);
-
-    OBSDataAutoRelease data = obs_data_create();
-    obs_data_set_bool(data, "streaming", streamingActive);
-    obs_data_set_bool(data, "recording", recordingActive);
-    obs_data_set_int(data, "bytes-per-sec", bytesPerSec);
-    obs_data_set_int(data, "kbits-per-sec", (bytesPerSec * 8) / 1024);
-    obs_data_set_int(data, "total-stream-time", totalStreamTime);
-    obs_data_set_int(data, "num-total-frames", totalFrames);
-    obs_data_set_int(data, "num-dropped-frames", droppedFrames);
-    obs_data_set_double(data, "fps", obs_get_active_fps());
-    obs_data_set_double(data, "strain", strain);
-    obs_data_set_bool(data, "preview-only", false); // Retrocompat with OBSRemote
-
-    broadcastUpdate("StreamStatus", data);
+    broadcastOutputStatistics(streamOutput, "StreamStatus", true /*isLegacyStreamStatus*/, _streamStarttime);
 }
+
+/**
+* Emit every 2 seconds.
+*
+* @return {boolean} `output-running` Current state of this output (true when running; false when stopped).
+* @return {int} `bytes-per-sec` Amount of data per second (in bytes) of throughput for this output.
+* @return {int} `kbits-per-sec` Amount of data per second (in kilobits) of throughput for this output.
+* @return {double} `strain` Percentage of dropped frames.
+* @return {int} `total-output-time` Total time (in seconds) since this output started.
+* @return {int} `num-total-frames` Total number of frames transmitted since the output started.
+* @return {int} `num-dropped-frames` Number of frames dropped by the encoder since the output started.
+* @return {double} `fps` Current framerate.
+*
+* @api events
+* @name StreamingStatistics
+* @category streaming
+* @since 5.0.0
+*/
+void WSEvents::StreamingStatistics() {
+    OBSOutputAutoRelease output = obs_frontend_get_streaming_output();
+
+    if (!output || !obs_frontend_streaming_active()) {
+        return;
+    }
+
+    broadcastOutputStatistics(output, "StreamingStatistics", false, _streamStarttime);
+}
+
+/**
+* Emit every 2 seconds.
+*
+* @return {boolean} `output-running` Current state of this output (true when running; false when stopped).
+* @return {int} `bytes-per-sec` Amount of data per second (in bytes) of throughput for this output.
+* @return {int} `kbits-per-sec` Amount of data per second (in kilobits) of throughput for this output.
+* @return {double} `strain` Percentage of dropped frames.
+* @return {int} `total-output-time` Total time (in seconds) since this output started.
+* @return {int} `num-total-frames` Total number of frames transmitted since the output started.
+* @return {int} `num-dropped-frames` Number of frames dropped by the encoder since the output started.
+* @return {double} `fps` Current framerate.
+*
+* @api events
+* @name RecordingStatistics
+* @category recording
+* @since 5.0.0
+*/
+void WSEvents::RecordingStatistics() {
+    OBSOutputAutoRelease output = obs_frontend_get_recording_output();
+
+    if (!output || !obs_frontend_recording_active()) {
+        return;
+    }
+
+    broadcastOutputStatistics(output, "RecordingStatistics", false, _recStarttime);
+}
+
+/**
+* Emit every 2 seconds.
+*
+* @return {boolean} `output-running` Current state of this output (true when running; false when stopped).
+* @return {int} `bytes-per-sec` Amount of data per second (in bytes) of throughput for this output.
+* @return {int} `kbits-per-sec` Amount of data per second (in kilobits) of throughput for this output.
+* @return {double} `strain` Percentage of dropped frames.
+* @return {int} `total-output-time` Total time (in seconds) since this output started.
+* @return {int} `num-total-frames` Total number of frames transmitted since the output started.
+* @return {int} `num-dropped-frames` Number of frames dropped by the encoder since the output started.
+* @return {double} `fps` Current framerate.
+*
+* @api events
+* @name ReplayBufferStatistics
+* @category replay buffer
+* @since 5.0.0
+*/
+void WSEvents::ReplayBufferStatistics() {
+    OBSOutputAutoRelease output = obs_frontend_get_replay_buffer_output();
+
+    if (!output || !obs_frontend_replay_buffer_active()) {
+        return;
+    }
+
+    broadcastOutputStatistics(output, "ReplayBufferStatistics", false, _replayStarttime);
+}
+
 
 /**
  * Emitted every 2 seconds after enabling it by calling SetHeartbeat.
